@@ -1,93 +1,89 @@
+import time
 import asyncio
-import aiomysql
 import aioredis
-import hashlib
+import aiomysql
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有域名（可修改为指定域）
+    allow_credentials=True,
+    allow_methods=["*"],  # 允许所有请求方法（包括 OPTIONS）
+    allow_headers=["*"],  # 允许所有请求头
+)
 
-# WebSocket 服务器信息
+host = "128.195.95.33"
+
+connection_cnt = {}
+update_time = {}
+lock = asyncio.Lock()
+
+# WebSocket 服务器信息（IP & 端口 & 本地 Redis 地址）
 WEBSOCKET_SERVERS = {
-    "server1": {"ip": "192.168.1.10", "port": 8001, "redis": "redis://192.168.1.10:6379"},
-    "server2": {"ip": "192.168.1.11", "port": 8002, "redis": "redis://192.168.1.11:6379"},
-    "server3": {"ip": "192.168.1.12", "port": 8003, "redis": "redis://192.168.1.12:6379"},
+    "server1": {"url": f"ws://{host}:8001", "redis": "redis://54.167.123.207:6379"},
+    "server2": {"url": f"ws://{host}:8002", "redis": "redis://52.55.16.91:6379"},
+    "server3": {"url": f"ws://{host}:8003", "redis": "redis://54.89.138.139:6379"}
 }
 
 class UserRequest(BaseModel):
     username: str
-    password: str
+    password: str  # 实际项目应使用哈希加密，这里简化处理
 
 async def get_websocket_server():
-    """ 查询 WebSocket 服务器的 Redis，获取连接数最少的服务器 """
-    min_server = None
-    min_connections = float("inf")
+    """ 查询每个 WebSocket 服务器的本地 Redis，获取连接数最少的服务器 """
+    global connection_cnt
+    global update_time
+    async with lock:
+        min_server = None
+        min_connections = float("inf")
 
-    for server_name, server_info in WEBSOCKET_SERVERS.items():
-        try:
-            redis = await aioredis.from_url(server_info["redis"])
-            connections = await redis.scard("connected_users")
-            connections = int(connections) if connections else 0
-            await redis.close()
+        for server_name, server_info in WEBSOCKET_SERVERS.items():
+            if server_name not in update_time or time.time() - update_time[server_name] > 1000:
+                try:
+                    # redis = await aioredis.from_url("redis://35.173.122.222:6379")
+                    redis = await aioredis.from_url(server_info["redis"])
+                    connections = await redis.scard("connected_users")
+                    connections = int(connections) if connections else 0
+                    connection_cnt[server_name] = connections
+                    # print(f"{server_name}: {connections} connections")
+                    await redis.close()
+                    """
+                    if connections < min_connections:
+                        min_connections = connections
+                        min_server = server_name
+                    """
+                    update_time[server_name] = time.time()
+                
+                except Exception as e:
+                    print(f"Failed to connect to Redis on {server_name}: {e}")
+            
+            print(f"{server_name}: {connection_cnt[server_name]} connections")
+            if connection_cnt[server_name] < min_connections:
+                    min_connections = connection_cnt[server_name]
+                    min_server = server_name
 
-            if connections < min_connections:
-                min_connections = connections
-                min_server = server_name
-        except Exception as e:
-            print(f"Failed to connect to Redis on {server_name}: {e}")
 
-    if min_server:
-        return WEBSOCKET_SERVERS[min_server]
-    else:
-        raise HTTPException(status_code=500, detail="No available WebSocket servers")
+        if min_server:
+            connection_cnt[min_server] += 1
+            return WEBSOCKET_SERVERS[min_server]
+            # return WEBSOCKET_SERVERS[min_server]
+        else:
+            raise HTTPException(status_code=500, detail="No available WebSocket servers")
 
 @app.post("/register")
 async def register_user(user: UserRequest):
-    """ 用户注册，并存入 MySQL """
-    username = user.username
-    password = user.password
-
-    async with mysql_pool.acquire() as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute("SELECT COUNT(*) FROM users WHERE username = %s", (username,))
-            result = await cursor.fetchone()
-            if result[0] > 0:
-                raise HTTPException(status_code=400, detail="Username already exists")
-
-            await cursor.execute("INSERT INTO users (username, password) VALUES (%s, %s)", (username, password))
-            await conn.commit()
-
+    """ 处理用户注册请求，分配 WebSocket 服务器 """
     server = await get_websocket_server()
     return {"message": "Registration successful", "websocket_server": server}
 
 @app.post("/login")
 async def login_user(user: UserRequest):
-    """ 用户登录，并验证 MySQL 账号密码 """
-    username = user.username
-    password = user.password # 加密密码
-
-    async with mysql_pool.acquire() as conn:
-        async with conn.cursor() as cursor:
-            await cursor.execute("SELECT password FROM users WHERE username = %s", (username,))
-            result = await cursor.fetchone()
-
-            if not result or result[0] != password:
-                raise HTTPException(status_code=400, detail="Invalid username or password")
-
+    """ 处理用户登录请求，分配 WebSocket 服务器 """
     server = await get_websocket_server()
     return {"message": "Login successful", "websocket_server": server}
-
-@app.on_event("startup")
-async def startup():
-    global mysql_pool
-    mysql_pool = await aiomysql.create_pool(
-        host="192.168.1.10",
-        user="root",
-        password="password",
-        db="testdb",
-        minsize=1,
-        maxsize=20
-    )
 
 if __name__ == "__main__":
     import uvicorn

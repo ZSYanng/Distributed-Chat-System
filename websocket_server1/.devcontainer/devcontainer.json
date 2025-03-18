@@ -1,0 +1,8 @@
+{
+	"name": "WebSocket Server 1",
+	"build": {
+		"context": "..",
+		"dockerfile": "../Dockerfile"
+	},
+	"runArgs": ["-p", "8001:8000", "--network=chat-network", "--name=websocket_1"]
+}

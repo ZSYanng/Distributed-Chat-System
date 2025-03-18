@@ -15,10 +15,10 @@ async def get_chatrooms(mysql_conn_pool, username):
     """
     从 MySQL 查询用户所属的聊天室
     """
-    chatrooms = {}
+    chatrooms = []
     # chatrooms = await redis.smembers(f"user:{username}:chatrooms")
     async with mysql_conn_pool.acquire() as conn:
-        async with conn.cursor() as cursor:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
             # cursor.execute(f"SELECT chatroom.room_name from belonging, chatroom,  where belonging")
             chatrooms = await get_chatrooms_from_MySQL(cursor, username)
     return chatrooms
@@ -30,7 +30,7 @@ async def get_chatroom_members(mysql_conn_pool, chatroom):
     # members = await redis.smembers(f"chatroom:{chatroom}")
     members = {}
     async with mysql_conn_pool.acquire() as conn:
-        async with conn.cursor() as cursor:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
             # cursor.execute(f"SELECT chatroom.room_name from belonging, chatroom,  where belonging")
             members = await get_chatroom_members_from_MySQL(cursor, chatroom)
     return members
@@ -41,7 +41,8 @@ async def get_chat_history(mysql_conn_pool, chatroom):
     """
     msg_history = {}
     async with mysql_conn_pool.acquire() as conn:
-        async with conn.cursor() as cursor:
+        async with conn.cursor(aiomysql.DictCursor) as cursor:
+            await conn.commit()
             # cursor.execute(f"SELECT chatroom.room_name from belonging, chatroom,  where belonging")
             msg_history = await get_chat_history_from_MySQL(cursor, chatroom)
     return msg_history
@@ -62,12 +63,10 @@ async def register(websocket, redis, mysql_conn_pool):
             return None, None
         elif username == "Producer":
             print("Producer connected")
-            await websocket.send(json.dumps({"success": "Producer connected to WebSocket Server 1"}))
-            return None, None
+            # await websocket.send(json.dumps({"success": "Producer connected to WebSocket Server 1"}))
         elif username == "Consumer":
             print("Consumer connected")
-            await websocket.send(json.dumps({"success":"Consumer connected to WebSocket Server 1"}))
-            return None, None
+            # await websocket.send(json.dumps({"success":"Consumer connected to WebSocket Server 1"}))
         elif username in connected_users:
             await websocket.send(json.dumps({"error":"User has already logged in"}))
             return None, None
@@ -80,7 +79,7 @@ async def register(websocket, redis, mysql_conn_pool):
         
         # 记录用户到 websocket 的映射
         connected_users[username] = websocket
-        redis.sadd("connected_users", username)
+        await redis.sadd("connected_users", username)
 
         # print(f"User {username} connected, chatrooms: {chatrooms}")
         print(f"User {username} connected")
@@ -102,10 +101,10 @@ async def request_handeler(websocket, path, redis, mysql_conn_pool):
 
             try:
                 data = json.loads(req)
-                action = data.get("action") # could be 'join', 'client message' or 'sorted message'
+                action = data.get("operation") # could be 'join', 'client message' or 'sorted message'
                 if action == "join_chatroom":
                     await join_group_handler(websocket, redis, mysql_conn_pool, data, username)
-                elif action == "client message":
+                elif action == "client_message":
                     await chat_receiving_handler(websocket, redis, mysql_conn_pool, data, username)
                 else:
                     await chat_sending_handler(websocket, redis, mysql_conn_pool, data, username)
@@ -117,35 +116,48 @@ async def request_handeler(websocket, path, redis, mysql_conn_pool):
     except websockets.exceptions.ConnectionClosed:
         print(f"User {username} disconnected")
         del connected_users[username]
-        redis.srem("connected_user", username)
+        await redis.srem("connected_user", username)
     
     finally:
         # 断开连接后清理数据
         if username in connected_users:
             del connected_users[username]
-            redis.srem("connected_user", username)
+            await redis.srem("connected_user", username)
     
 async def join_group_handler(websocket, redis, mysql_conn_pool, data, username):
     """
     handle clients' request of joining a channel (chatroom)
     """
     chatroom_name = data.get('chatroom')
-    chatrooms = await get_chatrooms(mysql_conn_pool, username)
-    if chatroom_name not in chatrooms:
-        print(f"successfully join chatroom: {chatroom_name}")
+    # chatrooms = await get_chatrooms(mysql_conn_pool, username)
+    # if chatroom_name not in chatrooms:
+    #    print(f"successfully join chatroom: {chatroom_name}")
         
-    await redis.sadd(f"user:{username}:chatrooms", chatroom_name)
-    await redis.sadd(f"chatroom:{chatroom_name}:users", username)
+    # await redis.sadd(f"user:{username}:chatrooms", chatroom_name)
+    # await redis.sadd(f"chatroom:{chatroom_name}:users", username)
+    print(f"{username} join chatroom: {chatroom_name}")
+    """
+    Get Chatroom History
+    """
+    chat_history = await get_chat_history(mysql_conn_pool, chatroom_name)
+    for chat in chat_history:
+        sender = chat["user"]
+        msg = chat["message"]
+        await websocket.send(json.dumps({"operation": "new_message", "chatroom": chatroom_name, "message": {"sender": sender, "content": msg}}))
+
     """
     write into mysql
     """
+    """
     async with mysql_conn_pool.acquire() as conn:
         async with conn.cursor() as cursor:
-            """
+            
             insert op
-            """
+            
             # cursor.execute(f"INSERT INTO belonging ()  {chatroom_name}")
 
+    """
+    
 async def chat_receiving_handler(websocket, redis, mysql_conn_pool, data, username):
     """
     handle messages received from websocket connected user
@@ -171,6 +183,8 @@ async def chat_receiving_handler(websocket, redis, mysql_conn_pool, data, userna
         print(f"Warning: {username} is not authorized to speak in {chatroom_name}")
         return
     # send this message to Kafka producer
+    producer_conn = connected_users["Producer"]
+    await producer_conn.send(json.dumps({"sender": username, "chatroom": chatroom_name,"content": content}))
     
 async def chat_sending_handler(websocket, redis, mysql_conn_pool, data, username):
     """
@@ -184,16 +198,16 @@ async def chat_sending_handler(websocket, redis, mysql_conn_pool, data, username
     for user in chatroom_members:
         if user in connected_users:
             socket = connected_users[user]
-            socket.send(data)
+            await socket.send(json.dumps({"operation": "new_message","chatroom": chatroom_name,"message": {"sender": sender, "content": content}}))
 
 async def main():
     # connect to Redis
-    redis = await aioredis.from_url("redis://35.173.122.222:6379")
+    redis = await aioredis.from_url("redis://54.167.123.207:6379")
     await redis.flushall()
     
     # connect to mysql
     master_pool = await aiomysql.create_pool(
-        host="35.173.122.222", # MySQL 服务器1地址
+        host="54.89.138.139", # MySQL 服务器1地址
         port = 3306,
         user="admin",
         password="Entishl-0606",
@@ -215,7 +229,7 @@ async def main():
         await request_handeler(websocket, path, redis, master_pool)
 
     # 启动 WebSocket 服务器
-    async with websockets.serve(handler, "0.0.0.0", 8000):
+    async with websockets.serve(handler, "0.0.0.0", 8000, ping_interval=20, ping_timeout=4000):
         print("Chat server started at ws://0.0.0.0:8000")
         await asyncio.Future()  # 服务器保持运行
 
